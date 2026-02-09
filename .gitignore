@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pio/
+
+# Local audio datasets / captures
+Data/
+data/
+
+# Generated plots
+Plots/
+plots/
+
+# Processed outputs
+Processed_Data/
+processed_data/
+processed-data/
