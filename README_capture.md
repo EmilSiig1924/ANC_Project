@@ -208,9 +208,16 @@ Useful firmware text commands (serial monitor):
 
 - `STATUS` -> prints PSRAM/baud/pin summary
 - `PING` -> returns `PONG`
+- `ANC AUTOLEVEL TARGET_DB=10 HZ=1000 BASE_MS=1000 TONE_MS=1000 START_AMP=0.05 MIN_AMP=0.005 MAX_AMP=0.35 ITER=8` -> quiet tone auto-level from mic feedback
 - `SELFTEST` (or `ANC SELFTEST`) -> runs on-device mic/DAC/phase diagnostics with `PASS/WARN/FAIL` lines
 - `ANC TONE HZ=1000 AMP=0.85 MS=3000` -> forces strong DAC tone output (speaker audibility check)
 - `ANC LOOPTEST HZ=1000 AMP=0.85 MS=2500 BASE_MS=1000 WAIT_MS=1500 THRESH_DB=8` -> baseline-vs-tone mic rise test (`PASS/FAIL`)
+
+One-command host runner for auto-level + ANC start:
+
+```bash
+python tools/anc_autolevel.py --port COM7
+```
 
 ANC runtime debug counters in `STATUS`/`LOG ANC`:
 

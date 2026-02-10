@@ -90,6 +90,18 @@ constexpr uint32_t kLoopTestDefaultToneMs = 2500;
 constexpr float kLoopTestDefaultThresholdDb = 8.0f;
 constexpr uint32_t kLoopTestDefaultWaitMs = 1500;
 
+// Quiet auto-level calibration defaults
+constexpr float kAutoLevelDefaultTargetDeltaDb = 10.0f;
+constexpr float kAutoLevelDefaultToneHz = 1000.0f;
+constexpr uint32_t kAutoLevelDefaultBaseMs = 1000;
+constexpr uint32_t kAutoLevelDefaultToneMs = 1000;
+constexpr float kAutoLevelDefaultStartAmp = 0.05f;
+constexpr float kAutoLevelDefaultMinAmp = 0.005f;
+constexpr float kAutoLevelDefaultMaxAmp = 0.35f;
+constexpr uint32_t kAutoLevelDefaultIterations = 8;
+constexpr float kAutoLevelDefaultToleranceDb = 1.0f;
+constexpr float kAutoLevelCalAmpScale = 0.8f;
+
 // -------------------------
 // Capture protocol structs
 // -------------------------
@@ -189,6 +201,9 @@ bool g_anc_tx_installed = false;
 String g_serial_line;
 uint32_t g_serial_last_rx_ms = 0;
 AncRuntime g_anc;
+float g_runtime_tone_amp = kToneDefaultAmp;
+float g_runtime_cal_amp = kAncDefaultCalAmp;
+bool g_runtime_cal_amp_tuned = false;
 
 // -------------------------
 // Utility helpers
@@ -257,6 +272,12 @@ float power_to_dbfs(float power) {
 
 const char* yes_no(bool v) {
   return v ? "YES" : "NO";
+}
+
+AncConfig make_default_anc_config() {
+  AncConfig cfg{};
+  cfg.cal_excitation_amp = g_runtime_cal_amp;
+  return cfg;
 }
 
 inline int slot_index_in_frame(MicSlot slot) {
@@ -1615,6 +1636,155 @@ void run_looptest(
   Serial.println("LOOPTEST END");
 }
 
+void run_autolevel(
+    float target_delta_db,
+    float tone_hz,
+    uint32_t base_ms,
+    uint32_t tone_ms,
+    float start_amp,
+    float min_amp,
+    float max_amp,
+    uint32_t iterations) {
+  Serial.println("AUTOLEVEL START");
+
+  bool pass = false;
+  if (!(target_delta_db >= 2.0f && target_delta_db <= 40.0f)) {
+    Serial.println("AUTOLEVEL FAIL PARAM TARGET_DB must be in [2, 40].");
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  if (!(tone_hz >= 20.0f && tone_hz <= 20000.0f)) {
+    Serial.println("AUTOLEVEL FAIL PARAM HZ must be in [20, 20000].");
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  if (base_ms < 100U || base_ms > 60000U || tone_ms < 100U || tone_ms > 60000U) {
+    Serial.println("AUTOLEVEL FAIL PARAM BASE_MS/TONE_MS must be in [100, 60000].");
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  if (!(min_amp > 0.0f && min_amp < max_amp && max_amp <= 0.95f)) {
+    Serial.println("AUTOLEVEL FAIL PARAM amplitude bounds invalid.");
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  if (iterations < 1U || iterations > 20U) {
+    Serial.println("AUTOLEVEL FAIL PARAM ITER must be in [1, 20].");
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+
+  if (g_anc.active) {
+    anc_stop();
+    Serial.println("AUTOLEVEL INFO ANC stopped before test.");
+  }
+
+  String err;
+  if (!configure_anc_stream(&err)) {
+    Serial.println("AUTOLEVEL FAIL STREAM_SETUP ERR=" + err);
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  warm_up_mic_i2s();
+
+  SelfTestMicMetrics base{};
+  if (!measure_mics_window_ms(base_ms, &base, &err)) {
+    uninstall_anc_stream_if_installed();
+    Serial.println("AUTOLEVEL FAIL BASELINE ERR=" + err);
+    Serial.println("AUTOLEVEL RESULT=FAIL");
+    Serial.println("AUTOLEVEL END");
+    return;
+  }
+  Serial.println(
+      String("AUTOLEVEL BASE REF_DBFS=") + String(base.ref_rms_dbfs, 2) +
+      " ERR_DBFS=" + String(base.err_rms_dbfs, 2) +
+      " FRAMES=" + String(base.frames));
+
+  float amp = fminf(fmaxf(start_amp, min_amp), max_amp);
+  float best_amp = amp;
+  float best_drive_delta = -200.0f;
+  float best_delta_ref = -200.0f;
+  float best_delta_err = -200.0f;
+  float best_abs_err = 1e9f;
+
+  for (uint32_t i = 0; i < iterations; ++i) {
+    SelfTestMicMetrics tone{};
+    uint32_t bytes = 0;
+    err = "";
+    if (!play_tone_and_measure_mics(tone_hz, amp, tone_ms, &tone, &bytes, &err)) {
+      uninstall_anc_stream_if_installed();
+      Serial.println("AUTOLEVEL FAIL TONE_MEASURE ERR=" + err);
+      Serial.println("AUTOLEVEL RESULT=FAIL");
+      Serial.println("AUTOLEVEL END");
+      return;
+    }
+
+    const float delta_ref = tone.ref_rms_dbfs - base.ref_rms_dbfs;
+    const float delta_err = tone.err_rms_dbfs - base.err_rms_dbfs;
+    const float drive_delta = (delta_ref > delta_err) ? delta_ref : delta_err;
+    const float delta_err_to_target = target_delta_db - drive_delta;
+    const float abs_err = fabsf(delta_err_to_target);
+
+    Serial.println(
+        String("AUTOLEVEL ITER=") + String(i + 1) +
+        " AMP=" + String(amp, 4) +
+        " DELTA_REF_DB=" + String(delta_ref, 2) +
+        " DELTA_ERR_DB=" + String(delta_err, 2) +
+        " DRIVE_DB=" + String(drive_delta, 2) +
+        " TARGET_DB=" + String(target_delta_db, 2));
+
+    if (abs_err < best_abs_err) {
+      best_abs_err = abs_err;
+      best_amp = amp;
+      best_drive_delta = drive_delta;
+      best_delta_ref = delta_ref;
+      best_delta_err = delta_err;
+    }
+
+    if (abs_err <= kAutoLevelDefaultToleranceDb) {
+      pass = true;
+      break;
+    }
+
+    const float adjust_scale = powf(10.0f, 0.5f * delta_err_to_target / 20.0f);
+    const float next_amp = fminf(fmaxf(amp * adjust_scale, min_amp), max_amp);
+    if (fabsf(next_amp - amp) < 1e-4f) {
+      break;
+    }
+    amp = next_amp;
+  }
+
+  uninstall_anc_stream_if_installed();
+  g_anc.active = false;
+  g_anc.phase = AncPhase::Idle;
+
+  g_runtime_tone_amp = best_amp;
+  g_runtime_cal_amp = fminf(fmaxf(best_amp * kAutoLevelCalAmpScale, 0.005f), 0.8f);
+  g_runtime_cal_amp_tuned = true;
+
+  const bool near_target = best_drive_delta >= (target_delta_db - 2.0f);
+  if (!pass && near_target) {
+    pass = true;
+  }
+
+  Serial.println(
+      String("OK ANC_AUTOLEVEL_DONE TONE_AMP=") + String(g_runtime_tone_amp, 4) +
+      " CAL_AMP=" + String(g_runtime_cal_amp, 4) +
+      " DRIVE_DB=" + String(best_drive_delta, 2) +
+      " DELTA_REF_DB=" + String(best_delta_ref, 2) +
+      " DELTA_ERR_DB=" + String(best_delta_err, 2) +
+      " TARGET_DB=" + String(target_delta_db, 2) +
+      " RESULT=" + (pass ? "PASS" : "WARN"));
+  Serial.println(String("AUTOLEVEL RESULT=") + (pass ? "PASS" : "WARN"));
+  Serial.println("AUTOLEVEL END");
+}
+
 bool selftest_play_dac_tone(String* err, uint32_t* out_bytes, float* out_rms_dbfs) {
   return play_dac_tone(
       kSelfTestToneHz,
@@ -1753,13 +1923,14 @@ void print_anc_help() {
   Serial.println("  ANC STOP");
   Serial.println("  ANC FREEZE");
   Serial.println("  ANC ADAPT [ADAPT_MS=0]");
+  Serial.println("  ANC AUTOLEVEL [TARGET_DB=10 HZ=1000 BASE_MS=1000 TONE_MS=1000 START_AMP=0.05 MIN_AMP=0.005 MAX_AMP=0.35 ITER=8]");
   Serial.println("  ANC TONE [HZ=1000 AMP=0.85 MS=3000]");
   Serial.println("  ANC LOOPTEST [HZ=1000 AMP=0.85 MS=2500 BASE_MS=1000 WAIT_MS=1500 THRESH_DB=8]");
   Serial.println("  ANC RESET");
   Serial.println("  ANC STATUS");
   Serial.println("  ANC SELFTEST");
   Serial.println("  LOG_MS: 0 disables periodic logs; 100..60000 ms controls rate.");
-  Serial.println("  Note: ANC START uses built-in defaults each run unless options override.");
+  Serial.println("  Note: ANC START uses defaults each run; CAL_AMP comes from latest AUTOLEVEL tune.");
 }
 
 void print_status() {
@@ -1796,6 +1967,9 @@ void print_status() {
   Serial.println(String("STATUS ANC_CAL_AMP=") + String(g_anc.cfg.cal_excitation_amp, 3));
   Serial.println(String("STATUS ANC_SIGN=") + String(g_anc.cfg.adapt_sign, 1));
   Serial.println(String("STATUS ANC_LOG_MS=") + String(g_anc.cfg.log_period_ms));
+  Serial.println(String("STATUS ANC_RUNTIME_TONE_AMP=") + String(g_runtime_tone_amp, 4));
+  Serial.println(String("STATUS ANC_RUNTIME_CAL_AMP=") + String(g_runtime_cal_amp, 4));
+  Serial.println(String("STATUS ANC_RUNTIME_CAL_AMP_TUNED=") + String(g_runtime_cal_amp_tuned ? 1 : 0));
   Serial.println(String("STATUS ANC_RX_READ_ERRS=") + String(g_anc.stats.rx_read_errors));
   Serial.println(String("STATUS ANC_RX_EMPTY_READS=") + String(g_anc.stats.rx_empty_reads));
   Serial.println(String("STATUS ANC_TX_WRITE_ERRS=") + String(g_anc.stats.tx_write_errors));
@@ -1852,7 +2026,7 @@ void handle_anc_command(const String& line) {
 
   if (upper.startsWith("ANC LOOPTEST")) {
     float tone_hz = kToneDefaultHz;
-    float tone_amp = kToneDefaultAmp;
+    float tone_amp = g_runtime_tone_amp;
     float thresh_db = kLoopTestDefaultThresholdDb;
     uint32_t tone_ms = kLoopTestDefaultToneMs;
     uint32_t base_ms = kLoopTestDefaultBaseMs;
@@ -1884,7 +2058,7 @@ void handle_anc_command(const String& line) {
 
   if (upper.startsWith("ANC TONE")) {
     float tone_hz = kToneDefaultHz;
-    float tone_amp = kToneDefaultAmp;
+    float tone_amp = g_runtime_tone_amp;
     uint32_t tone_ms = kToneDefaultMs;
     float f = 0.0f;
     uint32_t u32 = 0;
@@ -1923,6 +2097,54 @@ void handle_anc_command(const String& line) {
                    " MS=" + String(tone_ms) +
                    " RMS_DBFS=" + String(rms_dbfs, 2) +
                    " BYTES=" + String(bytes));
+    return;
+  }
+
+  if (upper.startsWith("ANC AUTOLEVEL")) {
+    float target_delta_db = kAutoLevelDefaultTargetDeltaDb;
+    float tone_hz = kAutoLevelDefaultToneHz;
+    uint32_t base_ms = kAutoLevelDefaultBaseMs;
+    uint32_t tone_ms = kAutoLevelDefaultToneMs;
+    float start_amp = kAutoLevelDefaultStartAmp;
+    float min_amp = kAutoLevelDefaultMinAmp;
+    float max_amp = kAutoLevelDefaultMaxAmp;
+    uint32_t iterations = kAutoLevelDefaultIterations;
+    float f = 0.0f;
+    uint32_t u32 = 0;
+    if (parse_float_option(upper, "TARGET_DB", &f)) {
+      target_delta_db = f;
+    }
+    if (parse_float_option(upper, "HZ", &f)) {
+      tone_hz = f;
+    }
+    if (parse_u32_option(upper, "BASE_MS", &u32)) {
+      base_ms = u32;
+    }
+    if (parse_u32_option(upper, "TONE_MS", &u32)) {
+      tone_ms = u32;
+    }
+    if (parse_float_option(upper, "START_AMP", &f)) {
+      start_amp = f;
+    }
+    if (parse_float_option(upper, "MIN_AMP", &f)) {
+      min_amp = f;
+    }
+    if (parse_float_option(upper, "MAX_AMP", &f)) {
+      max_amp = f;
+    }
+    if (parse_u32_option(upper, "ITER", &u32)) {
+      iterations = u32;
+    }
+
+    run_autolevel(
+        target_delta_db,
+        tone_hz,
+        base_ms,
+        tone_ms,
+        start_amp,
+        min_amp,
+        max_amp,
+        iterations);
     return;
   }
 
@@ -1973,7 +2195,7 @@ void handle_anc_command(const String& line) {
   if (upper.startsWith("ANC START") || upper.startsWith("ANC RUN")) {
     // Start from known defaults every run to avoid sticky runtime settings
     // (e.g., ADAPT_MS=0 persisting and causing "stuck in ADAPTING").
-    AncConfig cfg{};
+    AncConfig cfg = make_default_anc_config();
     uint32_t u32 = 0;
     float f = 0.0f;
     if (parse_u32_option(upper, "CAL_MS", &u32)) {
@@ -2021,8 +2243,9 @@ void handle_anc_command(const String& line) {
 void print_ready_banner() {
   Serial.println("ANC_CAPTURE_READY");
   Serial.println("REC format: REC <ms> MIC=<0|1|2>");
-  Serial.println("ANC format: ANC START [...], ANC STOP, ANC FREEZE, ANC ADAPT, ANC TONE, ANC LOOPTEST, ANC SELFTEST");
+  Serial.println("ANC format: ANC START [...], ANC STOP, ANC FREEZE, ANC ADAPT, ANC AUTOLEVEL, ANC TONE, ANC LOOPTEST, ANC SELFTEST");
   Serial.println("Quick diagnostic: SELFTEST");
+  Serial.println("Quiet level tune: ANC AUTOLEVEL");
   Serial.println("Speaker tone test: ANC TONE HZ=1000 AMP=0.85 MS=3000");
   Serial.println("Acoustic loop test: ANC LOOPTEST WAIT_MS=1500");
   Serial.println("Use STATUS for full runtime state.");

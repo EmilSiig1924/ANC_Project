@@ -33,6 +33,9 @@ One-shot simultaneous capture check to verify channel/mic mapping.
 - `tools/derive_band_from_audio.py`
 Derives recommended analysis band from source audio (WAV or ffmpeg-supported formats like M4A).
 
+- `tools/anc_autolevel.py`
+Runs on-device `ANC AUTOLEVEL` (quiet tone self-tuning from mic feedback) and optionally starts ANC with tuned defaults.
+
 - `analyze_mic_test.py`
 Reference/test WAV analysis with auto alignment and spectral metrics.
 
@@ -129,13 +132,19 @@ Recommended monitor settings:
 - `ANC STOP`
 - `ANC FREEZE`
 - `ANC ADAPT [ADAPT_MS=0]`
+- `ANC AUTOLEVEL [TARGET_DB=10 HZ=1000 BASE_MS=1000 TONE_MS=1000 START_AMP=0.05 MIN_AMP=0.005 MAX_AMP=0.35 ITER=8]`
 - `ANC RESET`
 - `ANC STATUS`
 
 Notes:
 
 - `ADAPT_MS=0` means adapt indefinitely.
-- `ANC START` now resets to built-in defaults each run unless overridden by options.
+- `ANC START` resets to defaults each run unless overridden by options.
+- `ANC AUTOLEVEL` stores runtime tuned values:
+  - `ANC_RUNTIME_TONE_AMP`
+  - `ANC_RUNTIME_CAL_AMP`
+  - `ANC_RUNTIME_CAL_AMP_TUNED=1`
+- `ANC START` uses the latest tuned `ANC_RUNTIME_CAL_AMP` unless `CAL_AMP=...` is passed explicitly.
 
 ### Diagnostics
 
@@ -202,6 +211,19 @@ PowerShell shortcut:
 ```powershell
 .\run_pair.ps1
 ```
+
+### Quiet auto-level then start ANC
+
+```bash
+python tools/anc_autolevel.py --port COM7
+```
+
+This command:
+
+1. Probes device status
+2. Runs `ANC AUTOLEVEL` (short quiet tone iterations against mic baseline)
+3. Stores tuned amplitudes in firmware runtime state
+4. Starts ANC using tuned `CAL_AMP`
 
 Defaults:
 
@@ -281,4 +303,3 @@ This keeps the repository focused on firmware/scripts while letting you run loca
 ## 12) Legacy / Supplemental Docs
 
 - `README_capture.md` remains as a detailed capture/analysis reference with extra examples.
-
