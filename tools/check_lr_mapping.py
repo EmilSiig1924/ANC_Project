@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""
+One-shot left/right slot mapping verification.
+
+Captures MIC=0 stereo and reports which channel is dominant so you can confirm
+physical mic placement versus firmware slot mapping.
+"""
+
 import argparse
 import math
 import re
@@ -9,6 +16,10 @@ import time
 import wave
 from pathlib import Path
 from typing import Tuple
+
+# -------------------------
+# Generic helpers
+# -------------------------
 
 
 def run_or_fail(cmd: list[str]) -> None:
@@ -105,6 +116,10 @@ def analyze_stereo_wav(path: Path) -> Tuple[int, int, float, float, float, float
     ch1_peak = peak_1 / full_scale
     return sample_rate_hz, frames, ch0_rms, ch1_rms, ch0_peak, ch1_peak
 
+
+# -------------------------
+# CLI entry
+# -------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(

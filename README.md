@@ -36,6 +36,12 @@ Derives recommended analysis band from source audio (WAV or ffmpeg-supported for
 - `tools/anc_autolevel.py`
 Runs on-device `ANC AUTOLEVEL` (quiet tone self-tuning from mic feedback) and optionally starts ANC with tuned defaults.
 
+- `tools/anc_delay_sweep.py`
+Sweeps ANC `DELAY` values, scores each run from `LOG ANC` in `FROZEN` phase, and optionally starts ANC with the best delay.
+
+- `tools/play_test_tone.py`
+Plays clear DAC test tones (`ANC TONE`) from PC with optional frequency sweep and safe ANC stop-first behavior.
+
 - `analyze_mic_test.py`
 Reference/test WAV analysis with auto alignment and spectral metrics.
 
@@ -113,6 +119,23 @@ Recommended monitor settings:
 - line ending `LF` (firmware also handles no line ending via idle flush)
 - only one app owning COM port at a time
 
+### Quiet startup recipe
+
+Use this serial command sequence right after flashing when you want the lowest-risk bring-up:
+
+```text
+ANC STOP
+STATUS
+ANC START CAL_SILENT=1 CAL_MS=1200 ADAPT_MS=3000 LOG_MS=1000 GAIN=0.20 LIMIT_DBFS=-18 DELAY=0 LEAK=0.00005 ADAPT_FLOOR_DBFS=-65 HOWL=1 HOWL_THRESH_DB=8 HOWL_WINDOW_MS=120 HOWL_HOLD_MS=1000 HOWL_MIN_GAIN=0.15
+STATUS
+```
+
+What this does:
+
+- Runs calibration silently (`CAL_SILENT=1`), so no intentional calibration noise is sent to speaker.
+- Starts with low output gain and stricter limiter.
+- Keeps howling guard enabled with aggressive protection defaults.
+
 ## 6) Firmware Command Reference
 
 ### General
@@ -128,7 +151,8 @@ Recommended monitor settings:
 
 ### ANC controls
 
-- `ANC START [CAL_MS=3000 ADAPT_MS=7000 MU=0.002 MUCAL=0.12 GAIN=1.0 LIMIT_DBFS=-6 CAL_AMP=0.20 SIGN=-1 LOG_MS=1000]`
+- `ANC START [CAL_MS=3000 ADAPT_MS=7000 MU=0.002 MUCAL=0.12 GAIN=1.0 LIMIT_DBFS=-6 CAL_AMP=0.20 CAL_OUT=1.0 CAL_SILENT=0 SIGN=-1 LOG_MS=1000 DELAY=0 LEAK=0.00005 ADAPT_FLOOR_DBFS=-70 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52 HOWL=1 HOWL_THRESH_DB=10 HOWL_WINDOW_MS=120 HOWL_HOLD_MS=800 HOWL_MIN_GAIN=0.20]`
+- `ANC DIRECT START [GAIN=0.15 LIMIT_DBFS=-20 SIGN=-1 LOG_MS=400 DELAY=0 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52]`
 - `ANC STOP`
 - `ANC FREEZE`
 - `ANC ADAPT [ADAPT_MS=0]`
@@ -140,6 +164,11 @@ Notes:
 
 - `ADAPT_MS=0` means adapt indefinitely.
 - `ANC START` resets to defaults each run unless overridden by options.
+- `CAL_OUT` controls audible calibration output level (`0..1`), while still running secondary-path identification.
+- `CAL_SILENT=1` is an alias for `CAL_OUT=0` (silent calibration).
+- `ANC DIRECT START` uses a true direct path: delayed reference inversion (`ref * SIGN * GAIN`) plus limiter, with no FxLMS adaptation updates.
+- Direct mode also supports optional conditioning:
+  - `HP_HZ` high-pass, `LP_HZ` low-pass, `GATE_DBFS` envelope gate
 - `ANC AUTOLEVEL` stores runtime tuned values:
   - `ANC_RUNTIME_TONE_AMP`
   - `ANC_RUNTIME_CAL_AMP`
@@ -224,6 +253,40 @@ This command:
 2. Runs `ANC AUTOLEVEL` (short quiet tone iterations against mic baseline)
 3. Stores tuned amplitudes in firmware runtime state
 4. Starts ANC using tuned `CAL_AMP`
+
+### Delay sweep then start best setting
+
+```bash
+python tools/anc_delay_sweep.py --port COM7
+```
+
+Default sweep is intentionally short (`DELAY=0,8,16`) to reduce test time.
+
+Example with tighter sweep:
+
+```bash
+python tools/anc_delay_sweep.py --port COM7 --delay-start 8 --delay-end 40 --delay-step 2
+```
+
+Run sweep in direct invert mode (no FxLMS adaptation):
+
+```bash
+python tools/anc_delay_sweep.py --port COM7 --direct --start-best
+```
+
+### Clear tone test (speaker chain)
+
+Single quiet tone:
+
+```bash
+python tools/play_test_tone.py --port COM7 --hz 1000 --amp 0.08 --ms 2500
+```
+
+Stepped sweep:
+
+```bash
+python tools/play_test_tone.py --port COM7 --amp 0.06 --ms 1200 --sweep-start-hz 200 --sweep-end-hz 3000 --sweep-step-hz 200
+```
 
 Defaults:
 

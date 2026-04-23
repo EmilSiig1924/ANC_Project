@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <driver/gpio.h>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -29,14 +30,14 @@ constexpr int kDacBclkPin = 4;
 constexpr int kDacWsPin = 5;
 constexpr int kDacDataPin = 6;
 
-// Existing capture protocol settings
-constexpr uint16_t kOutputBitsPerSample = 16;
-constexpr uint16_t kOutputChannelsMono = 1;
-constexpr uint16_t kOutputChannelsStereo = 2;
-constexpr uint32_t kDefaultDurationMs = 20000;
-constexpr uint32_t kMinDurationMs = 100;
-constexpr uint32_t kMaxDurationMs = 60000;
-constexpr uint8_t kMicBothId = 0;
+// Capture protocol settings (used by REC command + USB WAV export)
+constexpr uint16_t kOutputBitsPerSample = 16;    // WAV bit depth sent to host
+constexpr uint16_t kOutputChannelsMono = 1;      // MIC=1 or MIC=2
+constexpr uint16_t kOutputChannelsStereo = 2;    // MIC=0 (both mics at once)
+constexpr uint32_t kDefaultDurationMs = 20000;   // default REC length if user omits duration
+constexpr uint32_t kMinDurationMs = 100;         // REC safety lower bound
+constexpr uint32_t kMaxDurationMs = 60000;       // REC safety upper bound
+constexpr uint8_t kMicBothId = 0;                // MIC=0 means dual-channel capture
 
 // Frame layout for I2S_CHANNEL_FMT_RIGHT_LEFT is [Right, Left]
 enum class MicSlot : uint8_t {
@@ -61,18 +62,35 @@ constexpr int kControlFilterLen = 128;
 constexpr int kSecondaryFilterLen = 64;
 constexpr int kAncFramesPerBlock = 64;
 constexpr float kAncEpsilon = 1e-6f;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kTwoPi = 2.0f * kPi;
 
-constexpr uint32_t kAncDefaultCalMs = 3000;
-constexpr uint32_t kAncDefaultAdaptMs = 7000;  // adapt then freeze
-constexpr float kAncDefaultMu = 0.0020f;
-constexpr float kAncDefaultMuCal = 0.12f;
-constexpr float kAncDefaultOutputGain = 1.0f;
-constexpr float kAncDefaultLimiterDbfs = -6.0f;
-constexpr float kAncDefaultCalAmp = 0.20f;
-constexpr float kAncDefaultAdaptSign = -1.0f;
-constexpr uint32_t kAncDefaultLogMs = 1000;
+constexpr uint32_t kAncDefaultCalMs = 3000;           // secondary-path identification window
+constexpr uint32_t kAncDefaultAdaptMs = 7000;         // adaptation window before auto-freeze
+constexpr float kAncDefaultMu = 0.0020f;              // FxLMS adaptation rate
+constexpr float kAncDefaultMuCal = 0.12f;             // secondary-path ID adaptation rate
+constexpr float kAncDefaultOutputGain = 1.0f;         // output gain before limiter
+constexpr float kAncDefaultLimiterDbfs = -6.0f;       // soft limiter threshold
+constexpr float kAncDefaultCalAmp = 0.20f;            // calibration excitation amplitude
+constexpr float kAncDefaultCalOutGain = 1.0f;         // calibration output level (0 = silent calibration)
+constexpr float kAncDefaultAdaptSign = -1.0f;         // normally -1 for anti-noise polarity
+constexpr uint32_t kAncDefaultLogMs = 1000;           // periodic LOG ANC interval
+constexpr uint32_t kAncDefaultRefDelaySamples = 0;    // ref path delay compensation
+constexpr float kAncDefaultLeak = 0.00005f;           // small weight leakage for stability
+constexpr float kAncDefaultAdaptFloorDbfs = -70.0f;   // gate adaptation below this ref level
+constexpr float kAncDefaultCtrlSmoothMs = 0.0f;        // control-path smoothing window (0 disables)
+constexpr float kAncDirectDefaultHpHz = 70.0f;        // output high-pass to remove low rumble/DC
+constexpr float kAncDirectDefaultLpHz = 2200.0f;      // output low-pass to suppress high-frequency hiss/EMI
+constexpr float kAncDirectDefaultGateDbfs = -52.0f;   // direct-mode envelope gate threshold
+constexpr float kAncDirectGateReleaseMs = 50.0f;      // gate envelope release time
+constexpr bool kAncHowlGuardDefaultEnabled = true;    // enable anti-howl output ducking
+constexpr float kAncHowlGuardDefaultThreshDb = 10.0f; // trigger if output rises this many dB in window
+constexpr uint32_t kAncHowlGuardDefaultWindowMs = 120;
+constexpr uint32_t kAncHowlGuardDefaultHoldMs = 800;
+constexpr float kAncHowlGuardDefaultMinGain = 0.20f;  // output gain while guard is active
 constexpr uint32_t kStatusMinIntervalMs = 1000;
 constexpr uint32_t kSerialCmdIdleFlushMs = 200;
+constexpr uint32_t kAncMaxRefDelaySamples = 256;
 
 // On-device diagnostic self-test timings
 constexpr uint32_t kSelfTestMicWindowMs = 1200;
@@ -140,15 +158,29 @@ enum class AncPhase : uint8_t {
 };
 
 struct AncConfig {
-  uint32_t cal_ms = kAncDefaultCalMs;
-  uint32_t adapt_ms = kAncDefaultAdaptMs;
-  float mu = kAncDefaultMu;
-  float mu_cal = kAncDefaultMuCal;
-  float output_gain = kAncDefaultOutputGain;
-  float limiter_dbfs = kAncDefaultLimiterDbfs;
-  float cal_excitation_amp = kAncDefaultCalAmp;
-  float adapt_sign = kAncDefaultAdaptSign;
-  uint32_t log_period_ms = kAncDefaultLogMs;
+  uint32_t cal_ms = kAncDefaultCalMs;                   // calibration time for s_hat
+  uint32_t adapt_ms = kAncDefaultAdaptMs;               // adaptation time for w
+  float mu = kAncDefaultMu;                             // FxLMS step size
+  float mu_cal = kAncDefaultMuCal;                      // calibration step size
+  float output_gain = kAncDefaultOutputGain;            // output scale
+  float limiter_dbfs = kAncDefaultLimiterDbfs;          // limiter threshold
+  float cal_excitation_amp = kAncDefaultCalAmp;         // calibration noise amplitude
+  float cal_out_gain = kAncDefaultCalOutGain;           // audible calibration output gain
+  float adapt_sign = kAncDefaultAdaptSign;              // +1/-1 update polarity
+  uint32_t log_period_ms = kAncDefaultLogMs;            // periodic log cadence
+  uint32_t ref_delay_samples = kAncDefaultRefDelaySamples;  // ref delay compensation
+  float w_leak = kAncDefaultLeak;                       // leakage factor for control filter
+  float adapt_floor_dbfs = kAncDefaultAdaptFloorDbfs;   // disable adaptation below this ref level
+  float ctrl_smooth_ms = kAncDefaultCtrlSmoothMs;       // optional smoothing for adaptation metrics (no output averaging)
+  float direct_hp_hz = kAncDirectDefaultHpHz;           // ANC output high-pass cutoff (Hz), <=0 disables
+  float direct_lp_hz = kAncDirectDefaultLpHz;           // ANC output low-pass cutoff (Hz), <=0 disables
+  float direct_gate_dbfs = kAncDirectDefaultGateDbfs;   // direct mode noise gate threshold (dBFS)
+  bool howl_guard_enabled = kAncHowlGuardDefaultEnabled;  // auto-duck on fast output growth
+  float howl_guard_thresh_db = kAncHowlGuardDefaultThreshDb;  // dB jump threshold
+  uint32_t howl_guard_window_ms = kAncHowlGuardDefaultWindowMs;  // detection window
+  uint32_t howl_guard_hold_ms = kAncHowlGuardDefaultHoldMs;      // ducking hold time
+  float howl_guard_min_gain = kAncHowlGuardDefaultMinGain;       // gain while ducked
+  bool direct_mode = false;                             // true => direct invert path, no FxLMS/adaptation
 };
 
 struct AncStats {
@@ -174,6 +206,22 @@ struct AncRuntime {
   uint32_t cal_target_samples = 0;
   uint32_t adapt_target_samples = 0;  // 0 => no auto-freeze
   float limiter_linear = 0.5f;
+  float adapt_floor_power = 1e-8f;
+  float direct_gate_linear = 0.002f;
+  float direct_gate_env = 0.0f;
+  float direct_gate_env_decay = 0.999f;
+  float ctrl_smooth_alpha = 1.0f;
+  float ctrl_ref_ema = 0.0f;
+  float ctrl_err_ema = 0.0f;
+  float direct_hp_alpha = 0.0f;
+  float direct_hp_prev_x = 0.0f;
+  float direct_hp_prev_y = 0.0f;
+  float direct_lp_alpha = 0.0f;
+  float direct_lp_prev_y = 0.0f;
+  float howl_prev_out_dbfs = -200.0f;
+  uint32_t howl_last_check_ms = 0;
+  uint32_t howl_hold_until_ms = 0;
+  uint32_t howl_events = 0;
   uint32_t noise_state = 0x1f123bb5u;
 
   // FxLMS control path state
@@ -184,6 +232,8 @@ struct AncRuntime {
   float xf_ring[kControlFilterLen]{};
   int xf_head = 0;
   float xf_energy = kAncEpsilon;
+  float ref_delay_ring[kAncMaxRefDelaySamples + 1]{};
+  int ref_delay_head = 0;
 
   // Secondary path estimate (calibration)
   float s_hat[kSecondaryFilterLen]{};
@@ -228,6 +278,10 @@ const char* anc_phase_name(AncPhase phase) {
       return "FROZEN";
   }
   return "UNKNOWN";
+}
+
+const char* anc_mode_name(const AncConfig& cfg) {
+  return cfg.direct_mode ? "DIRECT" : "FXLMS";
 }
 
 const char* reset_reason_name(esp_reset_reason_t reason) {
@@ -277,6 +331,19 @@ const char* yes_no(bool v) {
 AncConfig make_default_anc_config() {
   AncConfig cfg{};
   cfg.cal_excitation_amp = g_runtime_cal_amp;
+  return cfg;
+}
+
+AncConfig make_direct_anc_config() {
+  AncConfig cfg = make_default_anc_config();
+  cfg.cal_ms = 0;
+  cfg.adapt_ms = 0;
+  cfg.direct_mode = true;
+  cfg.log_period_ms = 400;
+  cfg.output_gain = 0.15f;
+  cfg.limiter_dbfs = -20.0f;
+  cfg.adapt_sign = -1.0f;
+  cfg.ref_delay_samples = 0;
   return cfg;
 }
 
@@ -332,6 +399,39 @@ float ring_energy(const float (&ring)[N], int head) {
     acc += v * v;
   }
   return acc;
+}
+
+float push_ref_delay_and_get(float in_sample, uint32_t delay_samples) {
+  constexpr int kLen = static_cast<int>(kAncMaxRefDelaySamples + 1);
+  if (delay_samples > kAncMaxRefDelaySamples) {
+    delay_samples = kAncMaxRefDelaySamples;
+  }
+  g_anc.ref_delay_ring[g_anc.ref_delay_head] = in_sample;
+  int read_idx = g_anc.ref_delay_head - static_cast<int>(delay_samples);
+  if (read_idx < 0) {
+    read_idx += kLen;
+  }
+  const float out = g_anc.ref_delay_ring[read_idx];
+  g_anc.ref_delay_head = (g_anc.ref_delay_head + 1) % kLen;
+  return out;
+}
+
+float apply_output_bandlimit(float in_sample) {
+  float y = in_sample;
+
+  if (g_anc.direct_hp_alpha > 0.0f) {
+    const float hp_y = g_anc.direct_hp_alpha * (g_anc.direct_hp_prev_y + y - g_anc.direct_hp_prev_x);
+    g_anc.direct_hp_prev_x = y;
+    g_anc.direct_hp_prev_y = hp_y;
+    y = hp_y;
+  }
+
+  if (g_anc.direct_lp_alpha > 0.0f) {
+    g_anc.direct_lp_prev_y += g_anc.direct_lp_alpha * (y - g_anc.direct_lp_prev_y);
+    y = g_anc.direct_lp_prev_y;
+  }
+
+  return y;
 }
 
 float xorshift_noise(uint32_t* state) {
@@ -396,6 +496,89 @@ bool parse_float_option(const String& upper_line, const char* key, float* out) {
   return true;
 }
 
+void apply_common_anc_options(const String& upper_line, AncConfig* cfg) {
+  uint32_t u32 = 0;
+  float f = 0.0f;
+
+  if (parse_u32_option(upper_line, "LOG_MS", &u32)) {
+    cfg->log_period_ms = u32;
+  }
+  if (parse_u32_option(upper_line, "DELAY", &u32)) {
+    cfg->ref_delay_samples = u32;
+  }
+  if (parse_float_option(upper_line, "GAIN", &f)) {
+    cfg->output_gain = f;
+  }
+  if (parse_float_option(upper_line, "LIMIT_DBFS", &f)) {
+    cfg->limiter_dbfs = f;
+  }
+  if (parse_float_option(upper_line, "SIGN", &f)) {
+    cfg->adapt_sign = (f >= 0.0f) ? 1.0f : -1.0f;
+  }
+  if (parse_float_option(upper_line, "SMOOTH_MS", &f)) {
+    cfg->ctrl_smooth_ms = f;
+  }
+  if (parse_float_option(upper_line, "HP_HZ", &f)) {
+    cfg->direct_hp_hz = f;
+  }
+  if (parse_float_option(upper_line, "LP_HZ", &f)) {
+    cfg->direct_lp_hz = f;
+  }
+  if (parse_float_option(upper_line, "GATE_DBFS", &f)) {
+    cfg->direct_gate_dbfs = f;
+  }
+  if (parse_u32_option(upper_line, "HOWL", &u32)) {
+    cfg->howl_guard_enabled = (u32 != 0U);
+  }
+  if (parse_float_option(upper_line, "HOWL_THRESH_DB", &f)) {
+    cfg->howl_guard_thresh_db = f;
+  }
+  if (parse_u32_option(upper_line, "HOWL_WINDOW_MS", &u32)) {
+    cfg->howl_guard_window_ms = u32;
+  }
+  if (parse_u32_option(upper_line, "HOWL_HOLD_MS", &u32)) {
+    cfg->howl_guard_hold_ms = u32;
+  }
+  if (parse_float_option(upper_line, "HOWL_MIN_GAIN", &f)) {
+    cfg->howl_guard_min_gain = f;
+  }
+}
+
+void apply_adaptive_anc_options(const String& upper_line, AncConfig* cfg) {
+  uint32_t u32 = 0;
+  float f = 0.0f;
+
+  if (parse_u32_option(upper_line, "CAL_MS", &u32)) {
+    cfg->cal_ms = u32;
+  }
+  if (parse_u32_option(upper_line, "ADAPT_MS", &u32)) {
+    cfg->adapt_ms = u32;
+  }
+  if (parse_float_option(upper_line, "MU", &f)) {
+    cfg->mu = f;
+  }
+  if (parse_float_option(upper_line, "MUCAL", &f)) {
+    cfg->mu_cal = f;
+  }
+  if (parse_float_option(upper_line, "CAL_AMP", &f)) {
+    cfg->cal_excitation_amp = f;
+  }
+  if (parse_float_option(upper_line, "CAL_OUT", &f)) {
+    cfg->cal_out_gain = f;
+  }
+  if (parse_u32_option(upper_line, "CAL_SILENT", &u32) && u32 != 0U) {
+    cfg->cal_out_gain = 0.0f;
+  }
+  if (parse_float_option(upper_line, "LEAK", &f)) {
+    cfg->w_leak = f;
+  }
+  if (parse_float_option(upper_line, "ADAPT_FLOOR_DBFS", &f)) {
+    cfg->adapt_floor_dbfs = f;
+  }
+
+  apply_common_anc_options(upper_line, cfg);
+}
+
 // -------------------------
 // I2S management
 // -------------------------
@@ -406,6 +589,13 @@ void uninstall_capture_rx_if_installed() {
   }
   i2s_driver_uninstall(kMicI2sPort);
   g_capture_rx_installed = false;
+}
+
+void bias_mic_data_pin_to_known_idle_level() {
+  const gpio_num_t mic_data_gpio = static_cast<gpio_num_t>(kMicDataPin);
+  // Prevent floating SD line noise when microphones are unplugged/disconnected.
+  gpio_pullup_dis(mic_data_gpio);
+  gpio_pulldown_en(mic_data_gpio);
 }
 
 void uninstall_anc_stream_if_installed() {
@@ -422,6 +612,7 @@ void uninstall_anc_stream_if_installed() {
 bool configure_capture_rx_i2s(String* err) {
   uninstall_anc_stream_if_installed();
   uninstall_capture_rx_if_installed();
+  bias_mic_data_pin_to_known_idle_level();
 
   i2s_config_t cfg{};
   cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
@@ -476,6 +667,7 @@ bool configure_capture_rx_i2s(String* err) {
 bool configure_anc_stream(String* err) {
   uninstall_capture_rx_if_installed();
   uninstall_anc_stream_if_installed();
+  bias_mic_data_pin_to_known_idle_level();
 
   // RX (mics)
   i2s_config_t rx_cfg{};
@@ -819,14 +1011,27 @@ void anc_reset_state(bool clear_secondary) {
   memset(g_anc.w, 0, sizeof(g_anc.w));
   memset(g_anc.x_ring, 0, sizeof(g_anc.x_ring));
   memset(g_anc.xf_ring, 0, sizeof(g_anc.xf_ring));
+  memset(g_anc.ref_delay_ring, 0, sizeof(g_anc.ref_delay_ring));
   memset(g_anc.cal_u_ring, 0, sizeof(g_anc.cal_u_ring));
   if (clear_secondary) {
     memset(g_anc.s_hat, 0, sizeof(g_anc.s_hat));
   }
   g_anc.x_head = 0;
   g_anc.xf_head = 0;
+  g_anc.ref_delay_head = 0;
   g_anc.cal_u_head = 0;
   g_anc.xf_energy = kAncEpsilon;
+  g_anc.direct_gate_env = 0.0f;
+  g_anc.ctrl_smooth_alpha = 1.0f;
+  g_anc.ctrl_ref_ema = 0.0f;
+  g_anc.ctrl_err_ema = 0.0f;
+  g_anc.direct_hp_prev_x = 0.0f;
+  g_anc.direct_hp_prev_y = 0.0f;
+  g_anc.direct_lp_prev_y = 0.0f;
+  g_anc.howl_prev_out_dbfs = -200.0f;
+  g_anc.howl_last_check_ms = 0;
+  g_anc.howl_hold_until_ms = 0;
+  g_anc.howl_events = 0;
   g_anc.stats = AncStats{};
   g_anc.stats.last_log_ms = millis();
   g_anc.noise_state = 0x1f123bb5u;
@@ -909,6 +1114,12 @@ bool validate_anc_config(const AncConfig& cfg, String* err) {
     }
     return false;
   }
+  if (!(cfg.cal_out_gain >= 0.0f && cfg.cal_out_gain <= 1.0f)) {
+    if (err != nullptr) {
+      *err = "CAL_OUT must be in [0, 1].";
+    }
+    return false;
+  }
   if (!(cfg.limiter_dbfs <= -1.0f && cfg.limiter_dbfs >= -40.0f)) {
     if (err != nullptr) {
       *err = "LIMIT_DBFS must be between -40 and -1.";
@@ -925,6 +1136,79 @@ bool validate_anc_config(const AncConfig& cfg, String* err) {
   if (!(cfg.adapt_sign == 1.0f || cfg.adapt_sign == -1.0f)) {
     if (err != nullptr) {
       *err = "SIGN must be +1 or -1.";
+    }
+    return false;
+  }
+  if (cfg.ref_delay_samples > kAncMaxRefDelaySamples) {
+    if (err != nullptr) {
+      *err = String("DELAY must be in [0, ") + String(kAncMaxRefDelaySamples) + "].";
+    }
+    return false;
+  }
+  if (!(cfg.w_leak >= 0.0f && cfg.w_leak <= 0.01f)) {
+    if (err != nullptr) {
+      *err = "LEAK must be in [0, 0.01].";
+    }
+    return false;
+  }
+  if (!(cfg.adapt_floor_dbfs <= -10.0f && cfg.adapt_floor_dbfs >= -120.0f)) {
+    if (err != nullptr) {
+      *err = "ADAPT_FLOOR_DBFS must be in [-120, -10].";
+    }
+    return false;
+  }
+  if (!(cfg.ctrl_smooth_ms >= 0.0f && cfg.ctrl_smooth_ms <= 20.0f)) {
+    if (err != nullptr) {
+      *err = "SMOOTH_MS must be in [0, 20].";
+    }
+    return false;
+  }
+  if (!(cfg.direct_hp_hz >= 0.0f && cfg.direct_hp_hz <= 10000.0f)) {
+    if (err != nullptr) {
+      *err = "HP_HZ must be in [0, 10000].";
+    }
+    return false;
+  }
+  if (!(cfg.direct_lp_hz >= 0.0f && cfg.direct_lp_hz <= 20000.0f)) {
+    if (err != nullptr) {
+      *err = "LP_HZ must be in [0, 20000].";
+    }
+    return false;
+  }
+  if (cfg.direct_hp_hz > 0.0f && cfg.direct_lp_hz > 0.0f &&
+      cfg.direct_lp_hz <= cfg.direct_hp_hz) {
+    if (err != nullptr) {
+      *err = "LP_HZ must be > HP_HZ when both are enabled.";
+    }
+    return false;
+  }
+  if (!(cfg.direct_gate_dbfs <= -20.0f && cfg.direct_gate_dbfs >= -120.0f)) {
+    if (err != nullptr) {
+      *err = "GATE_DBFS must be in [-120, -20].";
+    }
+    return false;
+  }
+  if (!(cfg.howl_guard_thresh_db >= 3.0f && cfg.howl_guard_thresh_db <= 40.0f)) {
+    if (err != nullptr) {
+      *err = "HOWL_THRESH_DB must be in [3, 40].";
+    }
+    return false;
+  }
+  if (!(cfg.howl_guard_window_ms >= 20U && cfg.howl_guard_window_ms <= 5000U)) {
+    if (err != nullptr) {
+      *err = "HOWL_WINDOW_MS must be in [20, 5000].";
+    }
+    return false;
+  }
+  if (!(cfg.howl_guard_hold_ms >= 50U && cfg.howl_guard_hold_ms <= 10000U)) {
+    if (err != nullptr) {
+      *err = "HOWL_HOLD_MS must be in [50, 10000].";
+    }
+    return false;
+  }
+  if (!(cfg.howl_guard_min_gain > 0.0f && cfg.howl_guard_min_gain <= 1.0f)) {
+    if (err != nullptr) {
+      *err = "HOWL_MIN_GAIN must be in (0, 1].";
     }
     return false;
   }
@@ -945,7 +1229,10 @@ void anc_set_phase(AncPhase phase) {
   g_anc.phase = phase;
   g_anc.stats.phase_samples = 0;
   if (phase == AncPhase::Calibrating) {
-    Serial.println("OK ANC_PHASE=CALIBRATING");
+    Serial.println(String("OK ANC_PHASE=CALIBRATING EXCITATION=ON AMP=") +
+                   String(g_anc.cfg.cal_excitation_amp, 3) +
+                   " CAL_OUT=" + String(g_anc.cfg.cal_out_gain, 3) +
+                   " CAL_SILENT=" + String(g_anc.cfg.cal_out_gain <= 0.0f ? 1 : 0));
   } else if (phase == AncPhase::Adapting) {
     Serial.println("OK ANC_PHASE=ADAPTING");
   } else if (phase == AncPhase::Frozen) {
@@ -968,26 +1255,75 @@ bool anc_start(const AncConfig& cfg, String* err) {
   anc_reset_state(cfg.cal_ms > 0);
   g_anc.cfg = cfg;
   g_anc.limiter_linear = dbfs_to_linear(cfg.limiter_dbfs);
+  const float floor_linear = dbfs_to_linear(cfg.adapt_floor_dbfs);
+  g_anc.adapt_floor_power = floor_linear * floor_linear;
+  g_anc.direct_gate_linear = dbfs_to_linear(cfg.direct_gate_dbfs);
+  const float gate_release_s = fmaxf(kAncDirectGateReleaseMs / 1000.0f, 0.001f);
+  g_anc.direct_gate_env_decay = expf(-1.0f / (gate_release_s * static_cast<float>(kSampleRateHz)));
+  if (cfg.ctrl_smooth_ms > 0.0f) {
+    const float tau_s = fmaxf(cfg.ctrl_smooth_ms / 1000.0f, 0.0001f);
+    g_anc.ctrl_smooth_alpha = 1.0f - expf(-1.0f / (tau_s * static_cast<float>(kSampleRateHz)));
+  } else {
+    g_anc.ctrl_smooth_alpha = 1.0f;
+  }
+
+  if (cfg.direct_hp_hz > 0.0f) {
+    const float dt = 1.0f / static_cast<float>(kSampleRateHz);
+    const float rc = 1.0f / (kTwoPi * cfg.direct_hp_hz);
+    g_anc.direct_hp_alpha = rc / (rc + dt);
+  } else {
+    g_anc.direct_hp_alpha = 0.0f;
+  }
+
+  if (cfg.direct_lp_hz > 0.0f) {
+    const float dt = 1.0f / static_cast<float>(kSampleRateHz);
+    const float rc = 1.0f / (kTwoPi * cfg.direct_lp_hz);
+    g_anc.direct_lp_alpha = dt / (rc + dt);
+  } else {
+    g_anc.direct_lp_alpha = 0.0f;
+  }
   g_anc.cal_target_samples = static_cast<uint32_t>((static_cast<uint64_t>(cfg.cal_ms) * kSampleRateHz) / 1000ULL);
   g_anc.adapt_target_samples = static_cast<uint32_t>((static_cast<uint64_t>(cfg.adapt_ms) * kSampleRateHz) / 1000ULL);
+  g_anc.howl_prev_out_dbfs = -200.0f;
+  g_anc.howl_last_check_ms = millis();
+  g_anc.howl_hold_until_ms = 0;
+  g_anc.howl_events = 0;
   g_anc.active = true;
 
-  if (g_anc.cal_target_samples > 0U) {
+  if (cfg.direct_mode) {
+    g_anc.cal_target_samples = 0;
+    g_anc.adapt_target_samples = 0;
+    anc_set_phase(AncPhase::Frozen);
+  } else if (g_anc.cal_target_samples > 0U) {
     anc_set_phase(AncPhase::Calibrating);
   } else {
     // If no calibration requested, keep any existing s_hat and start adapting.
     anc_set_phase(AncPhase::Adapting);
   }
 
-  Serial.println(String("OK ANC_STARTED CAL_MS=") + String(cfg.cal_ms) +
+  Serial.println(String("OK ANC_STARTED MODE=") + anc_mode_name(cfg) +
+                 " CAL_MS=" + String(cfg.cal_ms) +
                  " ADAPT_MS=" + String(cfg.adapt_ms) +
                  " MU=" + String(cfg.mu, 6) +
                  " MUCAL=" + String(cfg.mu_cal, 6) +
                  " GAIN=" + String(cfg.output_gain, 4) +
                  " LIMIT_DBFS=" + String(cfg.limiter_dbfs, 2) +
                  " CAL_AMP=" + String(cfg.cal_excitation_amp, 3) +
+                 " CAL_OUT=" + String(cfg.cal_out_gain, 3) +
                  " SIGN=" + String(cfg.adapt_sign, 1) +
-                 " LOG_MS=" + String(cfg.log_period_ms));
+                 " LOG_MS=" + String(cfg.log_period_ms) +
+                 " DELAY=" + String(cfg.ref_delay_samples) +
+                 " LEAK=" + String(cfg.w_leak, 6) +
+                 " ADAPT_FLOOR_DBFS=" + String(cfg.adapt_floor_dbfs, 1) +
+                 " SMOOTH_MS=" + String(cfg.ctrl_smooth_ms, 2) +
+                 " HP_HZ=" + String(cfg.direct_hp_hz, 1) +
+                 " LP_HZ=" + String(cfg.direct_lp_hz, 1) +
+                 " GATE_DBFS=" + String(cfg.direct_gate_dbfs, 1) +
+                 " HOWL=" + String(cfg.howl_guard_enabled ? 1 : 0) +
+                 " HOWL_THRESH_DB=" + String(cfg.howl_guard_thresh_db, 1) +
+                 " HOWL_WINDOW_MS=" + String(cfg.howl_guard_window_ms) +
+                 " HOWL_HOLD_MS=" + String(cfg.howl_guard_hold_ms) +
+                 " HOWL_MIN_GAIN=" + String(cfg.howl_guard_min_gain, 2));
   return true;
 }
 
@@ -1007,11 +1343,13 @@ void anc_maybe_log() {
   const float ref_db = power_to_dbfs(g_anc.stats.ema_ref_pow);
   const float err_db = power_to_dbfs(g_anc.stats.ema_err_pow);
   const float out_db = power_to_dbfs(g_anc.stats.ema_out_pow);
+  const bool howl_active = static_cast<int32_t>(g_anc.howl_hold_until_ms - now) > 0;
   const float w_norm = anc_control_norm();
   const float s_norm = anc_secondary_norm();
 
   Serial.println(
-      String("LOG ANC PHASE=") + anc_phase_name(g_anc.phase) +
+      String("LOG ANC MODE=") + anc_mode_name(g_anc.cfg) +
+      " PHASE=" + anc_phase_name(g_anc.phase) +
       " REF_RMS_DBFS=" + String(ref_db, 2) +
       " ERR_RMS_DBFS=" + String(err_db, 2) +
       " OUT_RMS_DBFS=" + String(out_db, 2) +
@@ -1022,6 +1360,8 @@ void anc_maybe_log() {
       " TXSHORT=" + String(g_anc.stats.tx_short_writes) +
       " WNORM=" + String(w_norm, 4) +
       " SNORM=" + String(s_norm, 4) +
+      " HOWL_ACTIVE=" + String(howl_active ? 1 : 0) +
+      " HOWL_EVENTS=" + String(g_anc.howl_events) +
       " TOTAL_SAMPLES=" + String(static_cast<uint32_t>(g_anc.stats.total_samples & 0xFFFFFFFFULL)));
 }
 
@@ -1082,8 +1422,14 @@ void anc_process_block() {
   const size_t frames = words / 2;
   const int ref_idx = slot_index_in_frame(kReferenceSlot);
   const int err_idx = slot_index_in_frame(kErrorSlot);
+  const uint32_t now_ms = millis();
+  const bool howl_duck_active =
+      g_anc.cfg.howl_guard_enabled &&
+      (static_cast<int32_t>(g_anc.howl_hold_until_ms - now_ms) > 0);
+  const float howl_gain = howl_duck_active ? g_anc.cfg.howl_guard_min_gain : 1.0f;
 
   constexpr float ema_alpha = 0.002f;
+  double out_sq_sum = 0.0;
 
   for (size_t i = 0; i < frames; ++i) {
     const int32_t right_w = rx_buf[i * 2 + 0];
@@ -1093,18 +1439,44 @@ void anc_process_block() {
         decode_i2s_32_to_i16(left_w),
     };
 
-    const float ref = pcm16_to_float(slots[ref_idx]);
+    const float ref_raw = pcm16_to_float(slots[ref_idx]);
+    const float ref = push_ref_delay_and_get(ref_raw, g_anc.cfg.ref_delay_samples);
     const float err = pcm16_to_float(slots[err_idx]);
+    float ref_ctrl = ref;
+    float err_ctrl = err;
+    if (g_anc.ctrl_smooth_alpha < 1.0f) {
+      g_anc.ctrl_ref_ema += g_anc.ctrl_smooth_alpha * (ref - g_anc.ctrl_ref_ema);
+      g_anc.ctrl_err_ema += g_anc.ctrl_smooth_alpha * (err - g_anc.ctrl_err_ema);
+      ref_ctrl = g_anc.ctrl_ref_ema;
+      err_ctrl = g_anc.ctrl_err_ema;
+    }
     float out = 0.0f;
 
-    if (g_anc.phase == AncPhase::Calibrating) {
+    if (g_anc.cfg.direct_mode) {
+      // Direct mode: delayed reference -> optional output band-limit -> envelope gate -> sign/gain -> limiter.
+      float direct_x = apply_output_bandlimit(ref);
+
+      const float abs_x = fabsf(direct_x);
+      g_anc.direct_gate_env = fmaxf(abs_x, g_anc.direct_gate_env * g_anc.direct_gate_env_decay);
+      if (g_anc.direct_gate_env < g_anc.direct_gate_linear) {
+        direct_x = 0.0f;
+      }
+
+      out = direct_x * g_anc.cfg.output_gain * g_anc.cfg.adapt_sign * howl_gain;
+      bool saturated = false;
+      out = apply_soft_limiter(out, g_anc.limiter_linear, &saturated);
+      if (saturated) {
+        g_anc.stats.saturated_samples++;
+      }
+    } else if (g_anc.phase == AncPhase::Calibrating) {
       // Identify secondary path: d ~= s_hat * u
       const float u = xorshift_noise(&g_anc.noise_state) * g_anc.cfg.cal_excitation_amp;
-      out = u;
+      out = u * g_anc.cfg.cal_out_gain * howl_gain;
+      out = apply_output_bandlimit(out);
 
       ring_push(g_anc.cal_u_ring, g_anc.cal_u_head, u);
       const float pred = anc_dot_secondary_from_u(g_anc.s_hat, g_anc.cal_u_ring, g_anc.cal_u_head);
-      const float id_err = err - pred;
+      const float id_err = err_ctrl - pred;
       const float norm = kAncEpsilon + ring_energy(g_anc.cal_u_ring, g_anc.cal_u_head);
       const float step = g_anc.cfg.mu_cal * id_err / norm;
       for (int k = 0; k < kSecondaryFilterLen; ++k) {
@@ -1115,7 +1487,13 @@ void anc_process_block() {
       ring_push(g_anc.x_ring, g_anc.x_head, ref);
 
       const float y = anc_dot_control(g_anc.w, g_anc.x_ring, g_anc.x_head);
-      out = y * g_anc.cfg.output_gain;
+      out = y * g_anc.cfg.output_gain * howl_gain;
+      const float ref_pow_ctrl = ref_ctrl * ref_ctrl;
+      // Keep ANC quiet when reference energy is below the configured floor.
+      if (ref_pow_ctrl < g_anc.adapt_floor_power) {
+        out = 0.0f;
+      }
+      out = apply_output_bandlimit(out);
 
       bool saturated = false;
       out = apply_soft_limiter(out, g_anc.limiter_linear, &saturated);
@@ -1135,9 +1513,19 @@ void anc_process_block() {
           g_anc.xf_energy = kAncEpsilon;
         }
 
-        const float step = (g_anc.cfg.mu * g_anc.cfg.adapt_sign * err) / g_anc.xf_energy;
-        for (int k = 0; k < kControlFilterLen; ++k) {
-          g_anc.w[k] += step * ring_get(g_anc.xf_ring, g_anc.xf_head, k);
+        if (ref_pow_ctrl >= g_anc.adapt_floor_power) {
+          const float step = (g_anc.cfg.mu * g_anc.cfg.adapt_sign * err_ctrl) / g_anc.xf_energy;
+          const float leak = g_anc.cfg.w_leak;
+          const float keep = 1.0f - leak;
+          for (int k = 0; k < kControlFilterLen; ++k) {
+            const float prev = g_anc.w[k];
+            g_anc.w[k] = (keep * prev) + (step * ring_get(g_anc.xf_ring, g_anc.xf_head, k));
+          }
+        } else if (g_anc.cfg.w_leak > 0.0f) {
+          const float keep = 1.0f - g_anc.cfg.w_leak;
+          for (int k = 0; k < kControlFilterLen; ++k) {
+            g_anc.w[k] *= keep;
+          }
         }
       }
     }
@@ -1151,6 +1539,24 @@ void anc_process_block() {
     g_anc.stats.ema_ref_pow = (1.0f - ema_alpha) * g_anc.stats.ema_ref_pow + ema_alpha * (ref * ref);
     g_anc.stats.ema_err_pow = (1.0f - ema_alpha) * g_anc.stats.ema_err_pow + ema_alpha * (err * err);
     g_anc.stats.ema_out_pow = (1.0f - ema_alpha) * g_anc.stats.ema_out_pow + ema_alpha * (out * out);
+    out_sq_sum += static_cast<double>(out) * static_cast<double>(out);
+  }
+
+  if (g_anc.cfg.howl_guard_enabled && frames > 0U) {
+    const float block_out_dbfs =
+        power_to_dbfs(static_cast<float>(out_sq_sum / static_cast<double>(frames)));
+    if ((now_ms - g_anc.howl_last_check_ms) >= g_anc.cfg.howl_guard_window_ms) {
+      const float rise_db = block_out_dbfs - g_anc.howl_prev_out_dbfs;
+      g_anc.howl_prev_out_dbfs = block_out_dbfs;
+      g_anc.howl_last_check_ms = now_ms;
+      if (rise_db >= g_anc.cfg.howl_guard_thresh_db) {
+        g_anc.howl_hold_until_ms = now_ms + g_anc.cfg.howl_guard_hold_ms;
+        g_anc.howl_events++;
+        Serial.println(String("WARN ANC_HOWL_GUARD RISE_DB=") + String(rise_db, 2) +
+                       " OUT_DBFS=" + String(block_out_dbfs, 2) +
+                       " HOLD_MS=" + String(g_anc.cfg.howl_guard_hold_ms));
+      }
+    }
   }
 
   size_t bytes_written = 0;
@@ -1325,7 +1731,7 @@ bool play_dac_tone(
 
   const uint32_t target_frames =
       static_cast<uint32_t>((static_cast<uint64_t>(tone_ms) * kSampleRateHz) / 1000ULL);
-  const float phase_inc = 2.0f * static_cast<float>(M_PI) * tone_hz / static_cast<float>(kSampleRateHz);
+  const float phase_inc = kTwoPi * tone_hz / static_cast<float>(kSampleRateHz);
   float phase = 0.0f;
 
   uint32_t sent_frames = 0;
@@ -1339,8 +1745,8 @@ bool play_dac_tone(
     for (size_t i = 0; i < frames; ++i) {
       const float s = sinf(phase) * tone_amp;
       phase += phase_inc;
-      if (phase > 2.0f * static_cast<float>(M_PI)) {
-        phase -= 2.0f * static_cast<float>(M_PI);
+      if (phase > kTwoPi) {
+        phase -= kTwoPi;
       }
       const int16_t v = float_to_pcm16(s);
       tx_buf[i * 2 + 0] = v;
@@ -1429,7 +1835,7 @@ bool play_tone_and_measure_mics(
 
   const uint32_t target_frames =
       static_cast<uint32_t>((static_cast<uint64_t>(tone_ms) * kSampleRateHz) / 1000ULL);
-  const float phase_inc = 2.0f * static_cast<float>(M_PI) * tone_hz / static_cast<float>(kSampleRateHz);
+  const float phase_inc = kTwoPi * tone_hz / static_cast<float>(kSampleRateHz);
   float phase = 0.0f;
 
   const int ref_idx = slot_index_in_frame(kReferenceSlot);
@@ -1493,8 +1899,8 @@ bool play_tone_and_measure_mics(
 
       const float s = sinf(phase) * tone_amp;
       phase += phase_inc;
-      if (phase > 2.0f * static_cast<float>(M_PI)) {
-        phase -= 2.0f * static_cast<float>(M_PI);
+      if (phase > kTwoPi) {
+        phase -= kTwoPi;
       }
       const int16_t v = float_to_pcm16(s);
       tx_buf[i * 2 + 0] = v;
@@ -1919,7 +2325,8 @@ void run_selftest() {
 
 void print_anc_help() {
   Serial.println("ANC commands:");
-  Serial.println("  ANC START [CAL_MS=3000 ADAPT_MS=7000 MU=0.002 MUCAL=0.12 GAIN=1.0 LIMIT_DBFS=-6 CAL_AMP=0.20 SIGN=-1 LOG_MS=1000]");
+  Serial.println("  ANC START [CAL_MS=3000 ADAPT_MS=7000 MU=0.002 MUCAL=0.12 GAIN=1.0 LIMIT_DBFS=-6 CAL_AMP=0.20 CAL_OUT=1.0 CAL_SILENT=0 SIGN=-1 LOG_MS=1000 DELAY=0 LEAK=0.00005 ADAPT_FLOOR_DBFS=-70 SMOOTH_MS=0 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52 HOWL=1 HOWL_THRESH_DB=10 HOWL_WINDOW_MS=120 HOWL_HOLD_MS=800 HOWL_MIN_GAIN=0.20]");
+  Serial.println("  ANC DIRECT START [GAIN=0.15 LIMIT_DBFS=-20 SIGN=-1 LOG_MS=400 DELAY=0 SMOOTH_MS=0 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52 HOWL=1 HOWL_THRESH_DB=10 HOWL_WINDOW_MS=120 HOWL_HOLD_MS=800 HOWL_MIN_GAIN=0.20]");
   Serial.println("  ANC STOP");
   Serial.println("  ANC FREEZE");
   Serial.println("  ANC ADAPT [ADAPT_MS=0]");
@@ -1930,6 +2337,16 @@ void print_anc_help() {
   Serial.println("  ANC STATUS");
   Serial.println("  ANC SELFTEST");
   Serial.println("  LOG_MS: 0 disables periodic logs; 100..60000 ms controls rate.");
+  Serial.println("  DELAY: reference delay in samples (0..256).");
+  Serial.println("  LEAK: filter leakage (0..0.01), higher is more stable but less aggressive.");
+  Serial.println("  ADAPT_FLOOR_DBFS: adaptation gate based on ref level (-120..-10).");
+  Serial.println("  SMOOTH_MS: control/adaptation smoothing window in ms (0 disables, output path stays sample-by-sample).");
+  Serial.println("  HP_HZ / LP_HZ: output band-limiting for ANC output (set 0 to disable).");
+  Serial.println("  GATE_DBFS: direct-path envelope gate threshold (-120..-20).");
+  Serial.println("  CAL_OUT: calibration output gain [0..1]; 0 keeps calibration silent.");
+  Serial.println("  CAL_SILENT=1: alias for CAL_OUT=0.");
+  Serial.println("  HOWL=0|1 and HOWL_* options: anti-howling auto-duck guard.");
+  Serial.println("  DIRECT mode: no FxLMS updates; delayed+filtered reference inversion.");
   Serial.println("  Note: ANC START uses defaults each run; CAL_AMP comes from latest AUTOLEVEL tune.");
 }
 
@@ -1957,6 +2374,7 @@ void print_status() {
   Serial.println(String("STATUS REF_SLOT=") + ((kReferenceSlot == MicSlot::Left) ? "LEFT" : "RIGHT"));
   Serial.println(String("STATUS ERR_SLOT=") + ((kErrorSlot == MicSlot::Left) ? "LEFT" : "RIGHT"));
   Serial.println(String("STATUS ANC_ACTIVE=") + (g_anc.active ? "1" : "0"));
+  Serial.println(String("STATUS ANC_MODE=") + anc_mode_name(g_anc.cfg));
   Serial.println(String("STATUS ANC_PHASE=") + anc_phase_name(g_anc.phase));
   Serial.println(String("STATUS ANC_CAL_MS=") + String(g_anc.cfg.cal_ms));
   Serial.println(String("STATUS ANC_ADAPT_MS=") + String(g_anc.cfg.adapt_ms));
@@ -1965,8 +2383,25 @@ void print_status() {
   Serial.println(String("STATUS ANC_GAIN=") + String(g_anc.cfg.output_gain, 4));
   Serial.println(String("STATUS ANC_LIMIT_DBFS=") + String(g_anc.cfg.limiter_dbfs, 2));
   Serial.println(String("STATUS ANC_CAL_AMP=") + String(g_anc.cfg.cal_excitation_amp, 3));
+  Serial.println(String("STATUS ANC_CAL_OUT=") + String(g_anc.cfg.cal_out_gain, 3));
+  Serial.println(String("STATUS ANC_CAL_SILENT=") + String(g_anc.cfg.cal_out_gain <= 0.0f ? 1 : 0));
   Serial.println(String("STATUS ANC_SIGN=") + String(g_anc.cfg.adapt_sign, 1));
   Serial.println(String("STATUS ANC_LOG_MS=") + String(g_anc.cfg.log_period_ms));
+  Serial.println(String("STATUS ANC_DELAY_SAMPLES=") + String(g_anc.cfg.ref_delay_samples));
+  Serial.println(String("STATUS ANC_LEAK=") + String(g_anc.cfg.w_leak, 6));
+  Serial.println(String("STATUS ANC_ADAPT_FLOOR_DBFS=") + String(g_anc.cfg.adapt_floor_dbfs, 1));
+  Serial.println(String("STATUS ANC_CTRL_SMOOTH_MS=") + String(g_anc.cfg.ctrl_smooth_ms, 2));
+  Serial.println(String("STATUS ANC_HP_HZ=") + String(g_anc.cfg.direct_hp_hz, 1));
+  Serial.println(String("STATUS ANC_LP_HZ=") + String(g_anc.cfg.direct_lp_hz, 1));
+  Serial.println(String("STATUS ANC_GATE_DBFS=") + String(g_anc.cfg.direct_gate_dbfs, 1));
+  Serial.println(String("STATUS ANC_HOWL_GUARD=") + String(g_anc.cfg.howl_guard_enabled ? 1 : 0));
+  Serial.println(String("STATUS ANC_HOWL_THRESH_DB=") + String(g_anc.cfg.howl_guard_thresh_db, 1));
+  Serial.println(String("STATUS ANC_HOWL_WINDOW_MS=") + String(g_anc.cfg.howl_guard_window_ms));
+  Serial.println(String("STATUS ANC_HOWL_HOLD_MS=") + String(g_anc.cfg.howl_guard_hold_ms));
+  Serial.println(String("STATUS ANC_HOWL_MIN_GAIN=") + String(g_anc.cfg.howl_guard_min_gain, 2));
+  Serial.println(String("STATUS ANC_HOWL_EVENTS=") + String(g_anc.howl_events));
+  Serial.println(String("STATUS ANC_HOWL_ACTIVE=") +
+                 String((static_cast<int32_t>(g_anc.howl_hold_until_ms - millis()) > 0) ? 1 : 0));
   Serial.println(String("STATUS ANC_RUNTIME_TONE_AMP=") + String(g_runtime_tone_amp, 4));
   Serial.println(String("STATUS ANC_RUNTIME_CAL_AMP=") + String(g_runtime_cal_amp, 4));
   Serial.println(String("STATUS ANC_RUNTIME_CAL_AMP_TUNED=") + String(g_runtime_cal_amp_tuned ? 1 : 0));
@@ -2179,6 +2614,10 @@ void handle_anc_command(const String& line) {
       Serial.println("ERR ANC is not active.");
       return;
     }
+    if (g_anc.cfg.direct_mode) {
+      Serial.println("ERR ANC ADAPT is not available in DIRECT mode.");
+      return;
+    }
     uint32_t adapt_ms = 0;
     if (parse_u32_option(upper, "ADAPT_MS", &adapt_ms)) {
       g_anc.cfg.adapt_ms = adapt_ms;
@@ -2196,35 +2635,24 @@ void handle_anc_command(const String& line) {
     // Start from known defaults every run to avoid sticky runtime settings
     // (e.g., ADAPT_MS=0 persisting and causing "stuck in ADAPTING").
     AncConfig cfg = make_default_anc_config();
-    uint32_t u32 = 0;
-    float f = 0.0f;
-    if (parse_u32_option(upper, "CAL_MS", &u32)) {
-      cfg.cal_ms = u32;
+    apply_adaptive_anc_options(upper, &cfg);
+
+    if (g_anc.active) {
+      anc_stop();
     }
-    if (parse_u32_option(upper, "ADAPT_MS", &u32)) {
-      cfg.adapt_ms = u32;
+    String err;
+    if (!anc_start(cfg, &err)) {
+      Serial.println("ERR " + err);
+      return;
     }
-    if (parse_u32_option(upper, "LOG_MS", &u32)) {
-      cfg.log_period_ms = u32;
-    }
-    if (parse_float_option(upper, "MU", &f)) {
-      cfg.mu = f;
-    }
-    if (parse_float_option(upper, "MUCAL", &f)) {
-      cfg.mu_cal = f;
-    }
-    if (parse_float_option(upper, "GAIN", &f)) {
-      cfg.output_gain = f;
-    }
-    if (parse_float_option(upper, "LIMIT_DBFS", &f)) {
-      cfg.limiter_dbfs = f;
-    }
-    if (parse_float_option(upper, "CAL_AMP", &f)) {
-      cfg.cal_excitation_amp = f;
-    }
-    if (parse_float_option(upper, "SIGN", &f)) {
-      cfg.adapt_sign = (f >= 0.0f) ? 1.0f : -1.0f;
-    }
+    return;
+  }
+
+  if (upper.startsWith("ANC DIRECT START")) {
+    // Direct mode = no FxLMS adaptation:
+    // out = delayed_reference * SIGN * GAIN, then limiter.
+    AncConfig cfg = make_direct_anc_config();
+    apply_common_anc_options(upper, &cfg);
 
     if (g_anc.active) {
       anc_stop();
@@ -2243,9 +2671,10 @@ void handle_anc_command(const String& line) {
 void print_ready_banner() {
   Serial.println("ANC_CAPTURE_READY");
   Serial.println("REC format: REC <ms> MIC=<0|1|2>");
-  Serial.println("ANC format: ANC START [...], ANC STOP, ANC FREEZE, ANC ADAPT, ANC AUTOLEVEL, ANC TONE, ANC LOOPTEST, ANC SELFTEST");
+  Serial.println("ANC format: ANC START [...], ANC DIRECT START [...], ANC STOP, ANC FREEZE, ANC ADAPT, ANC AUTOLEVEL, ANC TONE, ANC LOOPTEST, ANC SELFTEST");
   Serial.println("Quick diagnostic: SELFTEST");
   Serial.println("Quiet level tune: ANC AUTOLEVEL");
+  Serial.println("Direct invert mode: ANC DIRECT START GAIN=0.15 LIMIT_DBFS=-20 DELAY=0 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52 HOWL=1");
   Serial.println("Speaker tone test: ANC TONE HZ=1000 AMP=0.85 MS=3000");
   Serial.println("Acoustic loop test: ANC LOOPTEST WAIT_MS=1500");
   Serial.println("Use STATUS for full runtime state.");

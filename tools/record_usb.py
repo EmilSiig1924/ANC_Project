@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""
+USB capture client for firmware REC command.
+
+Flow:
+1) Probe device over serial
+2) Send REC command
+3) Parse binary ANC1 header
+4) Stream PCM payload directly into a WAV file
+"""
+
 import argparse
 import struct
 import subprocess
@@ -8,69 +18,17 @@ import time
 import wave
 from pathlib import Path
 
+from serial_utils import (
+    choose_port,
+    load_pyserial,
+    open_serial_port,
+    print_device_line,
+)
+
+# Binary capture protocol constants.
 MAGIC = b"ANC1"
 HEADER_STRUCT = struct.Struct("<4sHHIIIHHII")
 HEADER_SIZE = HEADER_STRUCT.size
-
-
-def load_pyserial():
-    try:
-        import serial as pyserial
-        import serial.tools.list_ports as list_ports
-    except ImportError as exc:
-        raise SystemExit(
-            "Missing dependency: pyserial. Install with: pip install pyserial"
-        ) from exc
-    return pyserial, list_ports
-
-
-def choose_port(explicit_port: str | None, list_ports) -> str:
-    if explicit_port:
-        return explicit_port
-
-    ports = list(list_ports.comports())
-    if not ports:
-        raise RuntimeError("No serial ports found. Connect ESP32-S3 and retry.")
-    if len(ports) == 1:
-        return ports[0].device
-
-    usb_like = [
-        p.device
-        for p in ports
-        if "USB" in (p.description or "").upper() or "CDC" in (p.description or "").upper()
-    ]
-    if len(usb_like) == 1:
-        return usb_like[0]
-
-    listed = "\n".join(f"- {p.device}: {p.description}" for p in ports)
-    raise RuntimeError(
-        "Multiple ports detected. Pass --port explicitly.\n"
-        f"Available ports:\n{listed}"
-    )
-
-
-def open_serial_port(serial_module, port: str, baud: int):
-    """
-    Open serial port with control lines deasserted.
-    On some ESP32 auto-reset circuits, asserted DTR/RTS can hold/reset the MCU.
-    """
-    ser = serial_module.Serial()
-    ser.port = port
-    ser.baudrate = baud
-    ser.timeout = 0.5
-    ser.xonxoff = False
-    ser.rtscts = False
-    ser.dsrdtr = False
-    ser.dtr = False
-    ser.rts = False
-    ser.open()
-    ser.setDTR(False)
-    ser.setRTS(False)
-    return ser
-
-
-def print_device_line(text: str) -> None:
-    print(f"Device: {text}")
 
 
 def estimate_total_seconds(
@@ -300,7 +258,7 @@ def main() -> int:
     )
 
     try:
-        with open_serial_port(serial, port=port, baud=args.baud) as ser:
+        with open_serial_port(serial, port=port, baud=args.baud, timeout=0.5) as ser:
             # Give USB CDC moment to settle, then drop boot text.
             time.sleep(0.8)
             if not args.skip_preflight:

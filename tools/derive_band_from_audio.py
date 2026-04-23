@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""
+Derive recommended ANC analysis band from a source recording.
+
+Supports WAV directly and non-WAV formats through ffmpeg conversion.
+Outputs dominant energy band and optional PSD plot.
+"""
+
 import argparse
 import math
 import shutil
@@ -10,6 +17,10 @@ from pathlib import Path
 from typing import Tuple
 
 import numpy as np
+
+# -------------------------
+# Audio + PSD helpers
+# -------------------------
 
 
 def load_wav_mono(path: Path) -> Tuple[int, np.ndarray]:
@@ -113,6 +124,10 @@ def round_to_step(value: float, step: float) -> float:
     return round(value / step) * step
 
 
+# -------------------------
+# CLI entry
+# -------------------------
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -204,4 +219,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

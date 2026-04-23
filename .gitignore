@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 .pio/
+.venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
 
 # Local audio datasets / captures
 Data/

@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+"""
+High-level runner for capture + analysis.
+
+Default flow:
+1) Capture simultaneous baseline (MIC=0)
+2) Capture simultaneous run (MIC=0) or legacy sequential captures
+3) Split/mapping into reference + test WAV files
+4) Run analyze_mic_test.py and save plots
+"""
+
 import argparse
 import subprocess
 import sys
 import time
 import wave
 from pathlib import Path
+
+# -------------------------
+# Process helpers
+# -------------------------
 
 
 def run_or_fail(cmd: list[str]) -> None:
@@ -64,6 +78,10 @@ def split_stereo_to_mics(stereo_wav: Path, mic1_wav: Path, mic2_wav: Path) -> No
             wav_out.setframerate(sample_rate_hz)
             wav_out.writeframes(payload)
 
+
+# -------------------------
+# CLI entry
+# -------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(

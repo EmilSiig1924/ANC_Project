@@ -1,0 +1,27 @@
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+  ".pio",
+  ".venv",
+  "Data",
+  "Plots",
+  "Processed_Data",
+]
+
+[tool.ruff.lint]
+select = [
+  "B",
+  "E",
+  "F",
+  "I",
+  "SIM",
+  "UP",
+]
+ignore = [
+  "E501",
+]

@@ -208,15 +208,43 @@ Useful firmware text commands (serial monitor):
 
 - `STATUS` -> prints PSRAM/baud/pin summary
 - `PING` -> returns `PONG`
+- `ANC START CAL_SILENT=1` -> run ANC with silent calibration output (secondary-path ID still runs)
 - `ANC AUTOLEVEL TARGET_DB=10 HZ=1000 BASE_MS=1000 TONE_MS=1000 START_AMP=0.05 MIN_AMP=0.005 MAX_AMP=0.35 ITER=8` -> quiet tone auto-level from mic feedback
+- `ANC DIRECT START GAIN=0.15 LIMIT_DBFS=-20 SIGN=-1 LOG_MS=400 DELAY=0 HP_HZ=70 LP_HZ=2200 GATE_DBFS=-52` -> direct invert mode with band-limit + gate
 - `SELFTEST` (or `ANC SELFTEST`) -> runs on-device mic/DAC/phase diagnostics with `PASS/WARN/FAIL` lines
 - `ANC TONE HZ=1000 AMP=0.85 MS=3000` -> forces strong DAC tone output (speaker audibility check)
 - `ANC LOOPTEST HZ=1000 AMP=0.85 MS=2500 BASE_MS=1000 WAIT_MS=1500 THRESH_DB=8` -> baseline-vs-tone mic rise test (`PASS/FAIL`)
+
+Quiet startup recipe (serial monitor, copy/paste):
+
+```text
+ANC STOP
+STATUS
+ANC START CAL_SILENT=1 CAL_MS=1200 ADAPT_MS=3000 LOG_MS=1000 GAIN=0.20 LIMIT_DBFS=-18 DELAY=0 LEAK=0.00005 ADAPT_FLOOR_DBFS=-65 HOWL=1 HOWL_THRESH_DB=8 HOWL_WINDOW_MS=120 HOWL_HOLD_MS=1000 HOWL_MIN_GAIN=0.15
+STATUS
+```
+
+This recipe keeps calibration silent and starts ANC with conservative output/guard settings.
 
 One-command host runner for auto-level + ANC start:
 
 ```bash
 python tools/anc_autolevel.py --port COM7
+```
+
+Delay sweep runner (tests ANC `DELAY` and picks best):
+
+```bash
+python tools/anc_delay_sweep.py --port COM7
+```
+
+Default sweep is intentionally short (`DELAY=0,8,16`) to keep runs fast.
+Use `--direct` if you want delay sweep in direct invert mode (no FxLMS adaptation).
+
+Clear tone runner (single tone or sweep):
+
+```bash
+python tools/play_test_tone.py --port COM7 --hz 1000 --amp 0.08 --ms 2500
 ```
 
 ANC runtime debug counters in `STATUS`/`LOG ANC`:
